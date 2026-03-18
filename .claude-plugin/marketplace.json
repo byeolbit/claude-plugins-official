@@ -1292,6 +1292,16 @@
         "sha": "779ab61d8d412230eeec1840b8ca104bebea4358"
       },
       "homepage": "https://github.com/Digital-Process-Tools/claude-remember"
+    },
+    {
+      "name": "ai-plugins",
+      "description": "Set up endorctl and use Endor Labs to scan, prioritize, and fix security risks across your software supply chain",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/endorlabs/ai-plugins.git",
+        "sha": "a0f1d5632b6f9e6c26eaa9806f5d8d454ca5b06f"
+      },
+      "homepage": "https://www.endorlabs.com"
     }
   ]
 }
