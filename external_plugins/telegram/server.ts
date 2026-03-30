@@ -912,7 +912,10 @@ async function handleInbound(
   }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  const threadId = ctx.message?.message_thread_id
+  // Forum groups: General topic has no message_thread_id in the update, but API needs 1 to show typing in General.
+  const rawThreadId = ctx.message?.message_thread_id
+  const isForum = (ctx.chat as any)?.is_forum === true
+  const threadId = rawThreadId ?? (isForum ? 1 : undefined)
   void bot.api.sendChatAction(chat_id, 'typing', threadId != null ? { message_thread_id: threadId } : undefined).catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
