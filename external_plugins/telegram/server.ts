@@ -18,10 +18,19 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
+import { exec } from 'child_process'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+
+// --- topic routing: bypass butler for mapped forum topics ---
+const _butlerCfg = (() => {
+  try {
+    const raw = readFileSync(join(homedir(), 'dev/butler-claude/butler.config.json'), 'utf8')
+    return JSON.parse(raw)?.telegram?.topics as Record<string, { project: string; path: string }> | undefined
+  } catch { return undefined }
+})()
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -368,7 +377,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. If the tag has a thread_id attribute, the message is from a forum topic — pass thread_id to reply so the response goes to the correct topic thread.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -428,10 +437,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
           },
-          thread_id: {
-            type: 'string',
-            description: 'Forum topic thread ID. Pass thread_id from the inbound <channel> block to reply in the correct forum topic.',
-          },
           files: {
             type: 'array',
             items: { type: 'string' },
@@ -441,6 +446,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          thread_id: {
+            type: 'string',
+            description: 'Forum topic thread ID. Required when replying in a forum/topic group. Pass thread_id from the inbound <channel> block.',
           },
         },
         required: ['chat_id', 'text'],
@@ -499,9 +508,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const thread_id = args.thread_id != null ? Number(args.thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
-        const thread_id = args.thread_id != null ? Number(args.thread_id) : undefined
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
@@ -529,8 +538,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               (replyMode === 'all' || i === 0)
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
               ...(thread_id != null ? { message_thread_id: thread_id } : {}),
+              ...(parseMode ? { parse_mode: parseMode } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -754,6 +763,13 @@ bot.on('callback_query:data', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
+  console.log('[DEBUG] incoming message:', JSON.stringify({
+    chat_id: ctx.chat?.id,
+    chat_type: ctx.chat?.type,
+    from: ctx.from?.id,
+    thread_id: ctx.message?.message_thread_id,
+    text: ctx.message?.text?.slice(0, 50)
+  }))
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
@@ -918,6 +934,24 @@ async function handleInbound(
   const threadId = rawThreadId ?? (isForum ? 1 : undefined)
   void bot.api.sendChatAction(chat_id, 'typing', threadId != null ? { message_thread_id: threadId } : undefined).catch(() => {})
 
+  // --- topic routing: direct to subsession, bypass butler ---
+  if (_butlerCfg && rawThreadId != null) {
+    const mapping = _butlerCfg[String(rawThreadId)]
+    if (mapping) {
+      const proj = mapping.project
+      const projPath = mapping.path.replace(/^~/, homedir())
+      const escaped = text.replace(/'/g, "'\\''")
+      const check = `tmux list-windows -t butler -F '#{window_name}' 2>/dev/null | grep -Fx '${proj}'`
+      exec(check, (_err, stdout) => {
+        const script = stdout.trim()
+          ? `~/dev/butler-claude/scripts/subsession-send.sh '${proj}' '${escaped}' '${rawThreadId}' '${chat_id}'`
+          : `~/dev/butler-claude/scripts/subsession-start.sh '${proj}' '${projPath}' '${escaped}' '${rawThreadId}' '${chat_id}'`
+        exec(script, (e) => { if (e) process.stderr.write(`topic-route: ${e.message}\n`) })
+      })
+      return  // skip butler notification
+    }
+  }
+
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
@@ -944,7 +978,7 @@ async function handleInbound(
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(imagePath ? { image_path: imagePath } : {}),
-        ...(threadId != null ? { thread_id: String(threadId) } : {}),
+        ...(ctx.message?.message_thread_id != null ? { thread_id: String(ctx.message.message_thread_id) } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
           attachment_file_id: attachment.file_id,
